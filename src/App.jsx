@@ -4,7 +4,9 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts";
-import { Thermometer, Wind, Droplets, Flame, Gauge, Activity, Waves, Cpu } from "lucide-react";
+import { Thermometer, Wind, Droplets, Flame, Gauge, Activity, Waves, Cpu, Wifi, WifiOff } from "lucide-react";
+import { database } from "./firebaseConfig";
+import { ref, onValue } from "firebase/database";
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 const round = (value, digits = 2) => Number(value.toFixed(digits));
@@ -63,6 +65,7 @@ function buildNextSensorState(prev) {
     waterOutTemp: randomWalk(prev.waterOutTemp, 58, 84, 0.45),
     hydrogenFraction: prev.hydrogenFraction,
     moistureFraction: prev.moistureFraction,
+    humidity: prev.humidity ?? null,
   };
 }
 
@@ -77,22 +80,33 @@ const initialSensors = {
   waterOutTemp: 68,
   hydrogenFraction: 0.06,
   moistureFraction: 0.12,
+  humidity: null,
 };
 
-function MetricCard({ title, value, unit, icon: Icon, subtitle }) {
+// Fields that come from real ESP32 sensors
+const LIVE_FIELDS = new Set(["ambientTemp", "humidity", "coPpm", "flowRate"]);
+
+function MetricCard({ title, value, unit, icon: Icon, subtitle, isLive }) {
   return (
     <Card className="rounded-2xl shadow-sm border border-slate-200/50 bg-white/70 backdrop-blur-md transition-all hover:shadow-md hover:bg-white/90">
       <CardContent className="p-5">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <p className="text-sm font-medium text-slate-500">{title}</p>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium text-slate-500">{title}</p>
+              {isLive !== undefined && (
+                <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${isLive ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                  {isLive ? 'LIVE' : 'SIM'}
+                </span>
+              )}
+            </div>
             <div className="mt-2 flex items-end gap-2">
               <span className="text-3xl font-bold tracking-tight text-slate-900">{value}</span>
               <span className="pb-1 text-sm font-medium text-slate-500">{unit}</span>
             </div>
             {subtitle ? <p className="mt-2 text-xs font-medium text-slate-400">{subtitle}</p> : null}
           </div>
-          <div className="rounded-2xl bg-emerald-50 p-3 text-emerald-600 shadow-sm ring-1 ring-emerald-100">
+          <div className={`rounded-2xl p-3 shadow-sm ring-1 ${isLive ? 'bg-emerald-50 text-emerald-600 ring-emerald-100' : 'bg-slate-50 text-slate-500 ring-slate-100'}`}>
             <Icon className="h-5 w-5" />
           </div>
         </div>
@@ -101,11 +115,48 @@ function MetricCard({ title, value, unit, icon: Icon, subtitle }) {
   );
 }
 
+function SensorRow({ label, value, isLive }) {
+  return (
+    <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium text-slate-500">{label}</span>
+        <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${isLive ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'}`}>
+          {isLive ? '● ESP32' : 'SIM'}
+        </span>
+      </div>
+      <strong className="text-lg font-bold text-slate-900">{value}</strong>
+    </div>
+  );
+}
+
 export default function BiomassBoilerDashboard() {
   const [sensors, setSensors] = useState(initialSensors);
   const [history, setHistory] = useState([]);
+  const [espConnected, setEspConnected] = useState(false);
+  const [espData, setEspData] = useState(null);
   const metrics = useMemo(() => calculateMetrics(sensors), [sensors]);
 
+  // -------- Firebase: Listen for ESP32 data --------
+  useEffect(() => {
+    const sensorRef = ref(database, "/sensorData");
+    const unsubscribe = onValue(
+      sensorRef,
+      (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+          setEspConnected(true);
+          setEspData(data);
+        }
+      },
+      (error) => {
+        console.error("Firebase read error:", error);
+        setEspConnected(false);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
+
+  // Seed history on mount
   useEffect(() => {
     const seed = [];
     let rolling = initialSensors;
@@ -124,19 +175,42 @@ export default function BiomassBoilerDashboard() {
     setHistory(seed);
   }, []);
 
+  // -------- Merge ESP32 data with simulated data every 2s --------
   useEffect(() => {
     const id = setInterval(() => {
       setSensors((prev) => {
+        // Build next simulated state for fields without real sensors
         const next = buildNextSensorState(prev);
         if (next.waterOutTemp < next.waterInTemp + 5) {
           next.waterOutTemp = next.waterInTemp + 5;
         }
+
+        // Overwrite with real ESP32 data (only available sensor fields)
+        if (espData) {
+          if (espData.temperature !== undefined) {
+            next.ambientTemp = espData.temperature;
+          }
+          if (espData.humidity !== undefined) {
+            next.humidity = espData.humidity;
+          }
+          if (espData.gasValue !== undefined) {
+            next.coPpm = espData.gasValue;
+          }
+          if (espData.flowRate !== undefined) {
+            // flowRate from ESP32 is already in L/min
+            // Dashboard uses pulseFrequency to calculate flowRate via / 7.5
+            // So we reverse it: pulseFrequency = flowRate * 7.5
+            next.pulseFrequency = espData.flowRate * 7.5;
+          }
+        }
+
         return next;
       });
     }, 2000);
     return () => clearInterval(id);
-  }, []);
+  }, [espData]);
 
+  // Update history
   useEffect(() => {
     setHistory((prev) => {
       const nextId = prev.length > 0 ? parseInt(prev[prev.length - 1].t, 10) + 1 : prev.length + 1;
@@ -160,6 +234,8 @@ export default function BiomassBoilerDashboard() {
     { name: "Radiation", value: metrics.radiationLoss },
   ];
 
+  const hasEspData = espConnected && espData;
+
   return (
     <div className="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-100 via-slate-50 to-emerald-50/50 p-4 md:p-8 font-sans selection:bg-emerald-200 selection:text-emerald-900">
       <div className="mx-auto max-w-7xl space-y-6">
@@ -170,17 +246,30 @@ export default function BiomassBoilerDashboard() {
               <div className="flex flex-col gap-6 md:flex-row md:items-start md:justify-between">
                 <div className="max-w-xl">
                   <div className="mb-4 flex flex-wrap items-center gap-2">
-                    <Badge className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-700 border border-emerald-200 hover:bg-emerald-200 shadow-sm">
-                      <span className="mr-1.5 flex h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                      Simulated Live Data
+                    {hasEspData ? (
+                      <Badge className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-700 border border-emerald-200 hover:bg-emerald-200 shadow-sm">
+                        <Wifi className="mr-1.5 h-3 w-3" />
+                        <span className="mr-1.5 flex h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                        ESP32 Connected
+                      </Badge>
+                    ) : (
+                      <Badge className="rounded-full bg-amber-100 px-3 py-1 text-amber-700 border border-amber-200 hover:bg-amber-200 shadow-sm">
+                        <WifiOff className="mr-1.5 h-3 w-3" />
+                        Waiting for ESP32
+                      </Badge>
+                    )}
+                    <Badge variant="secondary" className="rounded-full bg-slate-100 border border-slate-200 text-slate-600 font-medium">
+                      {hasEspData ? "ESP32 → Firebase → Web" : "Simulated Data"}
                     </Badge>
-                    <Badge variant="secondary" className="rounded-full bg-slate-100 border border-slate-200 text-slate-600 font-medium">ESP32 → PC → Web</Badge>
                   </div>
                   <h1 className="text-4xl font-bold tracking-tight lg:text-5xl text-slate-900">
                     Biomass Boiler Efficiency Dashboard
                   </h1>
                   <p className="mt-4 text-slate-600 leading-relaxed text-sm md:text-base">
-                    Real-time dashboard using simulated ESP32 sensor values to calculate thermodynamics, combustion losses, overall efficiency, and water-side heat output.
+                    {hasEspData
+                      ? "Real-time data from ESP32 sensors (temperature, humidity, gas, flow) via Firebase. Other fields are simulated for demonstration."
+                      : "Waiting for ESP32 sensor data via Firebase. Currently showing simulated values for all fields."
+                    }
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-3 self-start sm:flex-nowrap md:min-w-[240px]">
@@ -188,9 +277,14 @@ export default function BiomassBoilerDashboard() {
                     <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500"><Cpu className="h-3.5 w-3.5 text-slate-400" /> Controller</div>
                     <div className="mt-1.5 text-base font-bold tracking-tight text-slate-900">ESP32</div>
                   </div>
-                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-3 px-4 transition-colors hover:bg-slate-100 min-w-[110px]">
-                    <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-slate-500"><Activity className="h-3.5 w-3.5 text-slate-400" /> Refresh</div>
-                    <div className="mt-1.5 text-base font-bold tracking-tight text-slate-900">2 sec</div>
+                  <div className={`rounded-2xl border p-3 px-4 transition-colors min-w-[110px] ${hasEspData ? 'border-emerald-200 bg-emerald-50 hover:bg-emerald-100' : 'border-slate-200 bg-slate-50 hover:bg-slate-100'}`}>
+                    <div className={`flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest ${hasEspData ? 'text-emerald-600' : 'text-slate-500'}`}>
+                      {hasEspData ? <Wifi className="h-3.5 w-3.5" /> : <WifiOff className="h-3.5 w-3.5 text-slate-400" />}
+                      Status
+                    </div>
+                    <div className={`mt-1.5 text-base font-bold tracking-tight ${hasEspData ? 'text-emerald-700' : 'text-slate-900'}`}>
+                      {hasEspData ? "Online" : "Offline"}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -230,22 +324,25 @@ export default function BiomassBoilerDashboard() {
               </CardTitle>
             </CardHeader>
             <CardContent className="grid gap-3 px-7 pb-7">
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">Flue gas temp</span><strong className="text-lg font-bold text-slate-900">{round(sensors.flueGasTemp)} °C</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">Ambient temp</span><strong className="text-lg font-bold text-slate-900">{round(sensors.ambientTemp)} °C</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">O₂ concentration</span><strong className="text-lg font-bold text-slate-900">{round(sensors.o2Percent)} %</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">CO₂ concentration</span><strong className="text-lg font-bold text-slate-900">{round(sensors.co2Percent)} %</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">CO concentration</span><strong className="text-lg font-bold text-slate-900">{round(sensors.coPpm)} ppm</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">Pulse frequency</span><strong className="text-lg font-bold text-slate-900">{round(sensors.pulseFrequency)} Hz</strong></div>
-              <div className="group flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50/50 p-4 transition-all hover:bg-white hover:shadow-sm"><span className="text-sm font-medium text-slate-500">Water in / out</span><strong className="text-lg font-bold text-slate-900">{round(sensors.waterInTemp)} / {round(sensors.waterOutTemp)} °C</strong></div>
+              <SensorRow label="Ambient temp (DHT22)" value={`${round(sensors.ambientTemp)} °C`} isLive={hasEspData} />
+              {sensors.humidity !== null && (
+                <SensorRow label="Humidity (DHT22)" value={`${round(sensors.humidity)} %`} isLive={hasEspData} />
+              )}
+              <SensorRow label="Flue gas temp" value={`${round(sensors.flueGasTemp)} °C`} isLive={false} />
+              <SensorRow label="O₂ concentration" value={`${round(sensors.o2Percent)} %`} isLive={false} />
+              <SensorRow label="CO₂ concentration" value={`${round(sensors.co2Percent)} %`} isLive={false} />
+              <SensorRow label="Gas sensor (MQ)" value={`${round(sensors.coPpm)}`} isLive={hasEspData} />
+              <SensorRow label="Flow rate" value={`${metrics.flowRateLpm} L/min`} isLive={hasEspData} />
+              <SensorRow label="Water in / out" value={`${round(sensors.waterInTemp)} / ${round(sensors.waterOutTemp)} °C`} isLive={false} />
             </CardContent>
           </Card>
         </div>
 
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <MetricCard title="Dry Flue Gas Loss" value={metrics.dryFlueGasLoss} unit="%" icon={Wind} subtitle="L1 = ((Tg − Ta) × 0.66) / (21 − O₂)" />
-          <MetricCard title="Hydrogen Loss" value={metrics.hydrogenLoss} unit="%" icon={Flame} subtitle="L2 = 9H(Tg − Ta) × 0.00024 × 100" />
-          <MetricCard title="Moisture Loss" value={metrics.moistureLoss} unit="%" icon={Droplets} subtitle="L3 = Mf(Tg − Ta) × 0.0008 × 100" />
-          <MetricCard title="CO Formation Loss" value={metrics.coLoss} unit="%" icon={Gauge} subtitle="L4 = CO / (CO + CO₂) × 100" />
+          <MetricCard title="Dry Flue Gas Loss" value={metrics.dryFlueGasLoss} unit="%" icon={Wind} subtitle="L1 = ((Tg − Ta) × 0.66) / (21 − O₂)" isLive={false} />
+          <MetricCard title="Hydrogen Loss" value={metrics.hydrogenLoss} unit="%" icon={Flame} subtitle="L2 = 9H(Tg − Ta) × 0.00024 × 100" isLive={false} />
+          <MetricCard title="Moisture Loss" value={metrics.moistureLoss} unit="%" icon={Droplets} subtitle="L3 = Mf(Tg − Ta) × 0.0008 × 100" isLive={false} />
+          <MetricCard title="CO Formation Loss" value={metrics.coLoss} unit="%" icon={Gauge} subtitle="L4 = CO / (CO + CO₂) × 100" isLive={hasEspData} />
         </div>
 
         <Tabs defaultValue="charts" className="space-y-4">
@@ -315,7 +412,7 @@ export default function BiomassBoilerDashboard() {
             </Card>
 
             <Card className="rounded-[24px] border border-slate-200/50 bg-white/70 backdrop-blur-sm shadow-sm hover:shadow-md transition-shadow">
-              <CardHeader className="pb-2"><CardTitle className="text-sm font-bold uppercase tracking-wider text-slate-500">Carbon Monoxide Trend (ppm)</CardTitle></CardHeader>
+              <CardHeader className="pb-2"><CardTitle className="text-sm font-bold uppercase tracking-wider text-slate-500">Gas Sensor Trend</CardTitle></CardHeader>
               <CardContent className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={history} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
@@ -329,7 +426,7 @@ export default function BiomassBoilerDashboard() {
                     <XAxis dataKey="t" tick={{ fill: '#64748b', fontSize: 12 }} tickLine={false} axisLine={false} />
                     <YAxis tick={{ fill: '#64748b', fontSize: 12 }} tickLine={false} axisLine={false} />
                     <Tooltip contentStyle={{ borderRadius: '12px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }} />
-                    <Area type="monotone" dataKey="co" stroke="#6366f1" strokeWidth={3} fillOpacity={1} fill="url(#colorCo)" name="CO (ppm)" />
+                    <Area type="monotone" dataKey="co" stroke="#6366f1" strokeWidth={3} fillOpacity={1} fill="url(#colorCo)" name="Gas Sensor" />
                   </AreaChart>
                 </ResponsiveContainer>
               </CardContent>
@@ -390,7 +487,14 @@ export default function BiomassBoilerDashboard() {
                   <div className="rounded-2xl bg-slate-50 p-4"><strong>Flow conversion</strong><br />Flowrate = PulseFrequency / 7.5</div>
                   <div className="rounded-2xl bg-slate-50 p-4"><strong>Mass flow of water</strong><br />ṁ ≈ Flowrate / 60</div>
                   <div className="rounded-2xl bg-slate-50 p-4"><strong>Useful heat output</strong><br />Q = ṁ × 4.186 × (Tout − Tin)</div>
-                  <div className="rounded-2xl bg-amber-50 p-4 text-amber-900"><strong>Current assumptions</strong><br />Hydrogen fraction H = 0.06, moisture fraction Mf = 0.12, water density ≈ 1000 kg/m³, sensor values are simulated for now.</div>
+                  <div className="rounded-2xl bg-emerald-50 p-4 text-emerald-900">
+                    <strong>Data Sources</strong><br />
+                    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold uppercase text-emerald-700 mr-1">ESP32</span>
+                    Temperature, Humidity, Gas sensor, Flow rate
+                    <br />
+                    <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase text-slate-500 mr-1">SIM</span>
+                    Flue gas temp, O₂, CO₂, Water temps, H fraction, Moisture fraction
+                  </div>
                 </div>
               </CardContent>
             </Card>
