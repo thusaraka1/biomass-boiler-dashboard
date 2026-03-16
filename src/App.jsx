@@ -145,6 +145,7 @@ export default function BiomassBoilerDashboard() {
         const data = snapshot.val();
         if (data) {
           setEspData(data);
+          setLastDataReceivedAt(Date.now());
           
           // FAST UPDATE: Update sensors immediately when real data arrives
           setSensors((prev) => {
@@ -164,24 +165,32 @@ export default function BiomassBoilerDashboard() {
     return () => unsubscribe();
   }, []);
 
-  // Monitor connection health based on serverTime
+  // Monitor connection health based on ESP32's lastUpdated timestamp
   useEffect(() => {
     const checkInterval = setInterval(() => {
-      if (espData && espData.serverTime) {
-        // Firebase SERVER_TIMESTAMP is in milliseconds. 
-        // We calculate if it hasn't changed in the last 10 seconds.
-        // Actually, better: if the time difference between NOW and serverTime is too high.
-        // But local clock and server clock might drift. 
-        // Best approach: If serverTime hasn't updated for two cycles of onValue.
-        // Or simply: if (Date.now() - espData.serverTime > 10000)
-        const age = Date.now() - espData.serverTime;
-        setEspConnected(age < 10000); 
-      } else {
-        setEspConnected(false);
+      if (espData && espData.lastUpdated) {
+        // The ESP32 sends `lastUpdated` as uptime in seconds.
+        // We can track if this value changes over time to ensure it's alive.
+        // To do this simply without state tracking, we can compare it to our local
+        // last seen change. A better approach is to update a local state whenever lastUpdated changes.
+        // We'll let `espConnected` be determined by how recently we received *any* new data in `onValue`.
+        // However, since `lastUpdated` is literally millis()/1000 from the ESP32, as long as it increases,
+        // it is online. 
       }
     }, 2000);
     return () => clearInterval(checkInterval);
   }, [espData]);
+
+  // Better approach: track when we last received Firebase data
+  const [lastDataReceivedAt, setLastDataReceivedAt] = useState(0);
+
+  useEffect(() => {
+    const checkInterval = setInterval(() => {
+      const age = Date.now() - lastDataReceivedAt;
+      setEspConnected(age < 10000 && lastDataReceivedAt > 0); 
+    }, 2000);
+    return () => clearInterval(checkInterval);
+  }, [lastDataReceivedAt]);
 
   // Seed history on mount
   useEffect(() => {
